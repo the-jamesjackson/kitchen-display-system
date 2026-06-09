@@ -2,40 +2,149 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const path = require('path');
-const { Server } = require('socket.io');
+const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
-const { pool, setup, generatePin, fetchActiveTickets, fetchClearedTickets } = require('./db');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const {
+  pool,
+  setup,
+  generatePin,
+  fetchActiveTickets,
+  fetchClearedTickets,
+  findManagerByUsername,
+  createManager,
+  getManagerRestaurant,
+  createSession,
+  findSessionManager,
+  deleteSession,
+} = require('./db');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
-});
+const wss = new WebSocketServer({ server, path: '/ws' });
 
 const clientDist = path.join(__dirname, '../client/dist');
+app.use(express.json());
 app.use(express.static(clientDist));
 app.get('/health', (_req, res) => res.sendStatus(200));
+
+// --- Manager auth (REST) ---------------------------------------------------
+// Auth and configuration are request/response, so they live on REST.
+// The live KDS stays on WebSocket. A manager's restaurant, once created here,
+// is just a normal service with a PIN — managers and staff enter it via the
+// existing WebSocket join flow.
+
+async function auth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Missing token.' });
+  const managerId = await findSessionManager(token);
+  if (!managerId) return res.status(401).json({ error: 'Invalid or expired session.' });
+  req.managerId = managerId;
+  req.token = token;
+  next();
+}
+
+// Create a session: a random opaque token stored server-side, returned to the client.
+async function issueToken(managerId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  await createSession(token, managerId);
+  return token;
+}
+
+app.post('/api/signup', async (req, res) => {
+  const username = String(req.body.username || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (username.length < 3 || password.length < 6) {
+    return res.status(400).json({ error: 'Username must be 3+ characters and password 6+ characters.' });
+  }
+  if (await findManagerByUsername(username)) {
+    return res.status(409).json({ error: 'That username is already taken.' });
+  }
+  const id = uuidv4();
+  const passwordHash = await bcrypt.hash(password, 10);
+  await createManager(id, username, passwordHash);
+  res.json({ token: await issueToken(id), username, restaurant: null });
+});
+
+app.post('/api/login', async (req, res) => {
+  const username = String(req.body.username || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  const manager = await findManagerByUsername(username);
+  if (!manager || !(await bcrypt.compare(password, manager.password_hash))) {
+    return res.status(401).json({ error: 'Invalid username or password.' });
+  }
+  const restaurant = await getManagerRestaurant(manager.id);
+  res.json({ token: await issueToken(manager.id), username, restaurant });
+});
+
+app.post('/api/logout', auth, async (req, res) => {
+  await deleteSession(req.token);
+  res.json({ ok: true });
+});
+
+app.get('/api/restaurant', auth, async (req, res) => {
+  res.json({ restaurant: await getManagerRestaurant(req.managerId) });
+});
+
+app.post('/api/restaurant', auth, async (req, res) => {
+  const name = String(req.body.restaurantName || '').trim();
+  if (!name) return res.status(400).json({ error: 'Restaurant name is required.' });
+  // One-to-one: if the manager already has a restaurant, return it instead of creating another.
+  const existing = await getManagerRestaurant(req.managerId);
+  if (existing) return res.json({ restaurant: existing });
+  const id = uuidv4();
+  const pin = await generatePin();
+  await pool.query(
+    'INSERT INTO services (id, pin, restaurant_name, created_at, mode, manager_id) VALUES ($1, $2, $3, $4, $5, $6)',
+    [id, pin, name, Date.now(), 'full', req.managerId]
+  );
+  res.json({ restaurant: { serviceId: id, pin, restaurantName: name } });
+});
+
+// SPA catch-all — must stay last so it doesn't swallow /api routes
 app.get('*', (_req, res) => res.sendFile(path.join(clientDist, 'index.html')));
 
-const IDLE_PURGE_MS = 24 * 60 * 60 * 1000;
+// serviceId -> Set<WebSocket>
+const rooms = new Map();
 
-// Every hour, purge services with no ticket activity in 24h
-setInterval(async () => {
-  const { rows } = await pool.query(`
-    SELECT s.id FROM services s
-    WHERE NOT EXISTS (
-      SELECT 1 FROM tickets t
-      WHERE t.service_id = s.id AND t.created_at > $1
-    ) AND s.created_at < $1
-  `, [Date.now() - IDLE_PURGE_MS]);
+function addToRoom(serviceId, ws) {
+  if (!rooms.has(serviceId)) rooms.set(serviceId, new Set());
+  rooms.get(serviceId).add(ws);
+}
 
-  for (const { id } of rows) {
-    await pool.query('DELETE FROM services WHERE id = $1', [id]);
-    io.to(id).emit('service_ended');
+function removeFromRoom(ws) {
+  if (!ws.serviceId) return;
+  const room = rooms.get(ws.serviceId);
+  if (!room) return;
+  room.delete(ws);
+  if (room.size === 0) rooms.delete(ws.serviceId);
+}
+
+function broadcast(serviceId, type, payload) {
+  const room = rooms.get(serviceId);
+  if (!room) return;
+  const msg = JSON.stringify({ type, payload });
+  for (const client of room) {
+    if (client.readyState === client.OPEN) client.send(msg);
   }
+}
+
+function send(ws, type, payload) {
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type, payload }));
+}
+
+const CLEARED_TICKET_PURGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Every hour, purge cleared tickets older than 7 days. Services survive indefinitely.
+setInterval(async () => {
+  await pool.query(
+    'DELETE FROM tickets WHERE cleared = true AND cleared_at < $1',
+    [Date.now() - CLEARED_TICKET_PURGE_MS]
+  );
 }, 60 * 60 * 1000);
 
-// Helper: fetch and format a single ticket by id
 async function getTicket(ticketId) {
   const { rows: ticketRows } = await pool.query('SELECT * FROM tickets WHERE id = $1', [ticketId]);
   if (ticketRows.length === 0) return null;
@@ -53,144 +162,160 @@ async function getTicket(ticketId) {
   };
 }
 
-io.on('connection', (socket) => {
+wss.on('connection', (ws) => {
+  ws.on('message', async (data) => {
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+    const { type, payload = {} } = msg;
 
-  // Look up a service by PIN without joining — for the "Join [name]?" confirmation step
-  socket.on('lookup_service', async ({ pin }) => {
-    const { rows } = await pool.query('SELECT id, restaurant_name FROM services WHERE pin = $1', [pin]);
-    if (rows.length === 0) {
-      socket.emit('service_error', { message: 'Invalid PIN. Please try again.' });
-      return;
+    switch (type) {
+      case 'lookup_service': {
+        const { rows } = await pool.query('SELECT restaurant_name FROM services WHERE pin = $1', [payload.pin]);
+        if (rows.length === 0) { send(ws, 'service_error', { message: 'Invalid PIN. Please try again.' }); return; }
+        send(ws, 'service_found', { restaurantName: rows[0].restaurant_name });
+        break;
+      }
+
+      case 'create_service': {
+        const name = String(payload.restaurantName || '').trim();
+        if (!name) return;
+        const id = uuidv4();
+        const pin = await generatePin();
+        const now = Date.now();
+        await pool.query(
+          'INSERT INTO services (id, pin, restaurant_name, created_at) VALUES ($1, $2, $3, $4)',
+          [id, pin, name, now]
+        );
+        ws.serviceId = id;
+        addToRoom(id, ws);
+        send(ws, 'service_created', { serviceId: id, pin, restaurantName: name, mode: 'quick' });
+        send(ws, 'init', { tickets: [], clearedTickets: [] });
+        break;
+      }
+
+      case 'join_service': {
+        const { rows } = await pool.query('SELECT id, restaurant_name, mode FROM services WHERE pin = $1', [payload.pin]);
+        if (rows.length === 0) { send(ws, 'service_error', { message: 'Invalid PIN. Please try again.' }); return; }
+        const { id, restaurant_name, mode } = rows[0];
+        ws.serviceId = id;
+        addToRoom(id, ws);
+        const [tickets, clearedTickets] = await Promise.all([fetchActiveTickets(id), fetchClearedTickets(id)]);
+        send(ws, 'service_joined', { serviceId: id, restaurantName: restaurant_name, mode });
+        send(ws, 'init', { tickets, clearedTickets });
+        break;
+      }
+
+      // Sent automatically by the client after a reconnect
+      case 'rejoin_service': {
+        const { rows } = await pool.query('SELECT id FROM services WHERE id = $1', [payload.serviceId]);
+        if (rows.length === 0) { send(ws, 'service_ended', {}); return; }
+        ws.serviceId = payload.serviceId;
+        addToRoom(payload.serviceId, ws);
+        const [tickets, clearedTickets] = await Promise.all([
+          fetchActiveTickets(payload.serviceId),
+          fetchClearedTickets(payload.serviceId),
+        ]);
+        send(ws, 'init', { tickets, clearedTickets });
+        break;
+      }
+
+      case 'create_ticket': {
+        const serviceId = ws.serviceId;
+        const { table, items } = payload;
+        if (!serviceId || !table || !Array.isArray(items) || items.length === 0) return;
+        const ticketId = uuidv4();
+        const now = Date.now();
+        await pool.query(
+          'INSERT INTO tickets (id, service_id, table_num, created_at, prioritized, cleared) VALUES ($1, $2, $3, $4, false, false)',
+          [ticketId, serviceId, String(table), now]
+        );
+        const mappedItems = items.map((item, position) => ({
+          id: uuidv4(),
+          name: String(item.name).trim(),
+          quantity: parseInt(item.quantity, 10) || 1,
+          mods: item.mods ? String(item.mods).trim() : '',
+          position,
+        }));
+        for (const item of mappedItems) {
+          await pool.query(
+            'INSERT INTO ticket_items (id, ticket_id, name, quantity, mods, done, tagged, position) VALUES ($1, $2, $3, $4, $5, false, false, $6)',
+            [item.id, ticketId, item.name, item.quantity, item.mods, item.position]
+          );
+        }
+        broadcast(serviceId, 'ticket_created', {
+          id: ticketId,
+          table: String(table),
+          createdAt: now,
+          prioritized: false,
+          items: mappedItems.map((i) => ({ ...i, done: false, tagged: false })),
+        });
+        break;
+      }
+
+      case 'toggle_item': {
+        const serviceId = ws.serviceId;
+        if (!serviceId) return;
+        const { rows } = await pool.query('SELECT done FROM ticket_items WHERE id = $1', [payload.itemId]);
+        if (rows.length === 0) return;
+        await pool.query('UPDATE ticket_items SET done = $1 WHERE id = $2', [!rows[0].done, payload.itemId]);
+        const ticket = await getTicket(payload.ticketId);
+        if (ticket) broadcast(serviceId, 'ticket_updated', ticket);
+        break;
+      }
+
+      case 'prioritize_ticket': {
+        const serviceId = ws.serviceId;
+        if (!serviceId) return;
+        const { rows } = await pool.query('SELECT prioritized FROM tickets WHERE id = $1', [payload.ticketId]);
+        if (rows.length === 0) return;
+        await pool.query('UPDATE tickets SET prioritized = $1 WHERE id = $2', [!rows[0].prioritized, payload.ticketId]);
+        const ticket = await getTicket(payload.ticketId);
+        if (ticket) broadcast(serviceId, 'ticket_updated', ticket);
+        break;
+      }
+
+      case 'tag_item': {
+        const serviceId = ws.serviceId;
+        if (!serviceId) return;
+        const { rows } = await pool.query('SELECT tagged FROM ticket_items WHERE id = $1', [payload.itemId]);
+        if (rows.length === 0) return;
+        await pool.query('UPDATE ticket_items SET tagged = $1 WHERE id = $2', [!rows[0].tagged, payload.itemId]);
+        const ticket = await getTicket(payload.ticketId);
+        if (ticket) broadcast(serviceId, 'ticket_updated', ticket);
+        break;
+      }
+
+      case 'clear_ticket': {
+        const serviceId = ws.serviceId;
+        if (!serviceId) return;
+        const clearedAt = Date.now();
+        await pool.query('UPDATE tickets SET cleared = true, cleared_at = $1 WHERE id = $2', [clearedAt, payload.ticketId]);
+        const ticket = await getTicket(payload.ticketId);
+        if (ticket) broadcast(serviceId, 'ticket_cleared', ticket);
+        break;
+      }
+
+      case 'unbump_ticket': {
+        const serviceId = ws.serviceId;
+        if (!serviceId) return;
+        await pool.query('UPDATE tickets SET cleared = false, cleared_at = NULL WHERE id = $1', [payload.ticketId]);
+        await pool.query('UPDATE ticket_items SET done = false WHERE ticket_id = $1', [payload.ticketId]);
+        const ticket = await getTicket(payload.ticketId);
+        if (ticket) broadcast(serviceId, 'ticket_unbumped', ticket);
+        break;
+      }
+
+      case 'end_service': {
+        const serviceId = ws.serviceId;
+        if (!serviceId) return;
+        await pool.query('DELETE FROM services WHERE id = $1', [serviceId]);
+        broadcast(serviceId, 'service_ended', {});
+        break;
+      }
     }
-    socket.emit('service_found', { restaurantName: rows[0].restaurant_name });
   });
 
-  // Create a new service session
-  socket.on('create_service', async ({ restaurantName }) => {
-    if (!restaurantName || !String(restaurantName).trim()) return;
-    const id = uuidv4();
-    const pin = await generatePin();
-    const now = Date.now();
-    await pool.query(
-      'INSERT INTO services (id, pin, restaurant_name, created_at) VALUES ($1, $2, $3, $4)',
-      [id, pin, String(restaurantName).trim(), now]
-    );
-    socket.serviceId = id;
-    socket.join(id);
-    socket.emit('service_created', { serviceId: id, pin, restaurantName: String(restaurantName).trim() });
-    socket.emit('init', { tickets: [], clearedTickets: [] });
-  });
-
-  // Join an existing service session by PIN
-  socket.on('join_service', async ({ pin }) => {
-    const { rows } = await pool.query('SELECT id, restaurant_name FROM services WHERE pin = $1', [pin]);
-    if (rows.length === 0) {
-      socket.emit('service_error', { message: 'Invalid PIN. Please try again.' });
-      return;
-    }
-    const { id, restaurant_name } = rows[0];
-    socket.serviceId = id;
-    socket.join(id);
-    const [tickets, clearedTickets] = await Promise.all([
-      fetchActiveTickets(id),
-      fetchClearedTickets(id),
-    ]);
-    socket.emit('service_joined', { serviceId: id, restaurantName: restaurant_name });
-    socket.emit('init', { tickets, clearedTickets });
-  });
-
-  socket.on('create_ticket', async ({ table, items }) => {
-    const serviceId = socket.serviceId;
-    if (!serviceId || !table || !Array.isArray(items) || items.length === 0) return;
-
-    const ticketId = uuidv4();
-    const now = Date.now();
-
-    await pool.query(
-      'INSERT INTO tickets (id, service_id, table_num, created_at, prioritized, cleared) VALUES ($1, $2, $3, $4, false, false)',
-      [ticketId, serviceId, String(table), now]
-    );
-
-    const mappedItems = items.map((item, position) => ({
-      id: uuidv4(),
-      name: String(item.name).trim(),
-      quantity: parseInt(item.quantity, 10) || 1,
-      mods: item.mods ? String(item.mods).trim() : '',
-      position,
-    }));
-
-    for (const item of mappedItems) {
-      await pool.query(
-        'INSERT INTO ticket_items (id, ticket_id, name, quantity, mods, done, tagged, position) VALUES ($1, $2, $3, $4, $5, false, false, $6)',
-        [item.id, ticketId, item.name, item.quantity, item.mods, item.position]
-      );
-    }
-
-    const ticket = {
-      id: ticketId,
-      table: String(table),
-      createdAt: now,
-      prioritized: false,
-      items: mappedItems.map((i) => ({ ...i, done: false, tagged: false })),
-    };
-
-    io.to(serviceId).emit('ticket_created', ticket);
-  });
-
-  socket.on('toggle_item', async ({ ticketId, itemId }) => {
-    const serviceId = socket.serviceId;
-    if (!serviceId) return;
-    const { rows } = await pool.query('SELECT done FROM ticket_items WHERE id = $1', [itemId]);
-    if (rows.length === 0) return;
-    await pool.query('UPDATE ticket_items SET done = $1 WHERE id = $2', [!rows[0].done, itemId]);
-    const ticket = await getTicket(ticketId);
-    if (ticket) io.to(serviceId).emit('ticket_updated', ticket);
-  });
-
-  socket.on('prioritize_ticket', async ({ ticketId }) => {
-    const serviceId = socket.serviceId;
-    if (!serviceId) return;
-    const { rows } = await pool.query('SELECT prioritized FROM tickets WHERE id = $1', [ticketId]);
-    if (rows.length === 0) return;
-    await pool.query('UPDATE tickets SET prioritized = $1 WHERE id = $2', [!rows[0].prioritized, ticketId]);
-    const ticket = await getTicket(ticketId);
-    if (ticket) io.to(serviceId).emit('ticket_updated', ticket);
-  });
-
-  socket.on('tag_item', async ({ ticketId, itemId }) => {
-    const serviceId = socket.serviceId;
-    if (!serviceId) return;
-    const { rows } = await pool.query('SELECT tagged FROM ticket_items WHERE id = $1', [itemId]);
-    if (rows.length === 0) return;
-    await pool.query('UPDATE ticket_items SET tagged = $1 WHERE id = $2', [!rows[0].tagged, itemId]);
-    const ticket = await getTicket(ticketId);
-    if (ticket) io.to(serviceId).emit('ticket_updated', ticket);
-  });
-
-  socket.on('clear_ticket', async ({ ticketId }) => {
-    const serviceId = socket.serviceId;
-    if (!serviceId) return;
-    const clearedAt = Date.now();
-    await pool.query('UPDATE tickets SET cleared = true, cleared_at = $1 WHERE id = $2', [clearedAt, ticketId]);
-    const ticket = await getTicket(ticketId);
-    if (ticket) io.to(serviceId).emit('ticket_cleared', ticket);
-  });
-
-  socket.on('unbump_ticket', async ({ ticketId }) => {
-    const serviceId = socket.serviceId;
-    if (!serviceId) return;
-    await pool.query('UPDATE tickets SET cleared = false, cleared_at = NULL WHERE id = $1', [ticketId]);
-    await pool.query('UPDATE ticket_items SET done = false WHERE ticket_id = $1', [ticketId]);
-    const ticket = await getTicket(ticketId);
-    if (ticket) io.to(serviceId).emit('ticket_unbumped', ticket);
-  });
-
-  socket.on('end_service', async () => {
-    const serviceId = socket.serviceId;
-    if (!serviceId) return;
-    await pool.query('DELETE FROM services WHERE id = $1', [serviceId]);
-    io.to(serviceId).emit('service_ended');
-  });
+  ws.on('close', () => removeFromRoom(ws));
 });
 
 const PORT = process.env.PORT || 3001;

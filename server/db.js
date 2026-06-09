@@ -7,6 +7,19 @@ const pool = new Pool({
 
 async function setup() {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS managers (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      manager_id TEXT NOT NULL REFERENCES managers(id) ON DELETE CASCADE,
+      created_at BIGINT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS services (
       id TEXT PRIMARY KEY,
       pin TEXT NOT NULL UNIQUE,
@@ -39,6 +52,18 @@ async function setup() {
   // For existing deployments without service_id on tickets
   await pool.query(`
     ALTER TABLE tickets ADD COLUMN IF NOT EXISTS service_id TEXT REFERENCES services(id) ON DELETE CASCADE;
+  `);
+
+  // Mode system: 'quick' = anonymous PIN service, 'full' = manager-owned with config + ML
+  await pool.query(`
+    ALTER TABLE services ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'quick';
+    ALTER TABLE services ADD COLUMN IF NOT EXISTS manager_id TEXT REFERENCES managers(id) ON DELETE CASCADE;
+    ALTER TABLE services ADD COLUMN IF NOT EXISTS target_ticket_time INTEGER;
+  `);
+
+  // One-to-one: each manager owns at most one service. NULLs (quick services) are allowed to repeat.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS services_manager_unique ON services(manager_id);
   `);
 }
 
@@ -94,4 +119,56 @@ function formatTicket(t, items) {
   };
 }
 
-module.exports = { pool, setup, generatePin, fetchActiveTickets, fetchClearedTickets };
+async function findManagerByUsername(username) {
+  const { rows } = await pool.query('SELECT * FROM managers WHERE username = $1', [username]);
+  return rows[0] || null;
+}
+
+async function createManager(id, username, passwordHash) {
+  await pool.query(
+    'INSERT INTO managers (id, username, password_hash, created_at) VALUES ($1, $2, $3, $4)',
+    [id, username, passwordHash, Date.now()]
+  );
+}
+
+// Sessions: a random token row per login. Stateful, so logout/revocation is just a DELETE.
+async function createSession(token, managerId) {
+  await pool.query(
+    'INSERT INTO sessions (token, manager_id, created_at) VALUES ($1, $2, $3)',
+    [token, managerId, Date.now()]
+  );
+}
+
+// Returns the manager_id for a valid token, or null
+async function findSessionManager(token) {
+  const { rows } = await pool.query('SELECT manager_id FROM sessions WHERE token = $1', [token]);
+  return rows[0] ? rows[0].manager_id : null;
+}
+
+async function deleteSession(token) {
+  await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+}
+
+// Returns the manager's single service as { serviceId, pin, restaurantName }, or null
+async function getManagerRestaurant(managerId) {
+  const { rows } = await pool.query(
+    'SELECT id, pin, restaurant_name FROM services WHERE manager_id = $1',
+    [managerId]
+  );
+  if (rows.length === 0) return null;
+  return { serviceId: rows[0].id, pin: rows[0].pin, restaurantName: rows[0].restaurant_name };
+}
+
+module.exports = {
+  pool,
+  setup,
+  generatePin,
+  fetchActiveTickets,
+  fetchClearedTickets,
+  findManagerByUsername,
+  createManager,
+  getManagerRestaurant,
+  createSession,
+  findSessionManager,
+  deleteSession,
+};

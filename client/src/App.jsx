@@ -1,10 +1,9 @@
 import { useEffect, useState } from 'react';
-import { io } from 'socket.io-client';
+import { on, off, send, setServiceId, clearServiceId } from './ws';
+import { logout, getToken } from './auth';
 import TicketForm from './components/TicketForm';
 import TicketCard from './components/TicketCard';
 import LandingPage from './components/LandingPage';
-
-const socket = io();
 
 export default function App() {
   const [session, setSession] = useState(null); // { serviceId, restaurantName }
@@ -13,84 +12,77 @@ export default function App() {
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
-    socket.on('connect', () => setConnected(true));
-    socket.on('disconnect', () => setConnected(false));
-
-    socket.on('init', ({ tickets: active, clearedTickets: cleared }) => {
+    const onConnect = () => setConnected(true);
+    const onDisconnect = () => setConnected(false);
+    const onInit = ({ tickets: active, clearedTickets: cleared }) => {
       setTickets(active);
       setClearedTickets(cleared);
-    });
-
-    socket.on('ticket_created', (ticket) => {
-      setTickets((prev) => [...prev, ticket]);
-    });
-
-    socket.on('ticket_updated', (updatedTicket) => {
-      setTickets((prev) => prev.map((t) => (t.id === updatedTicket.id ? updatedTicket : t)));
-    });
-
-    socket.on('ticket_cleared', (ticket) => {
+    };
+    const onTicketCreated = (ticket) => setTickets((prev) => [...prev, ticket]);
+    const onTicketUpdated = (updated) => setTickets((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+    const onTicketCleared = (ticket) => {
       setTickets((prev) => prev.filter((t) => t.id !== ticket.id));
       setClearedTickets((prev) => [ticket, ...prev].slice(0, 30));
-    });
-
-    socket.on('ticket_unbumped', (ticket) => {
+    };
+    const onTicketUnbumped = (ticket) => {
       setClearedTickets((prev) => prev.filter((t) => t.id !== ticket.id));
       setTickets((prev) => [...prev, ticket]);
-    });
-
-    socket.on('service_ended', () => {
+    };
+    const onServiceEnded = () => {
+      clearServiceId();
       setSession(null);
       setTickets([]);
       setClearedTickets([]);
-    });
+    };
+
+    on('connect', onConnect);
+    on('disconnect', onDisconnect);
+    on('init', onInit);
+    on('ticket_created', onTicketCreated);
+    on('ticket_updated', onTicketUpdated);
+    on('ticket_cleared', onTicketCleared);
+    on('ticket_unbumped', onTicketUnbumped);
+    on('service_ended', onServiceEnded);
 
     return () => {
-      socket.off('connect');
-      socket.off('disconnect');
-      socket.off('init');
-      socket.off('ticket_created');
-      socket.off('ticket_updated');
-      socket.off('ticket_cleared');
-      socket.off('ticket_unbumped');
-      socket.off('service_ended');
+      off('connect', onConnect);
+      off('disconnect', onDisconnect);
+      off('init', onInit);
+      off('ticket_created', onTicketCreated);
+      off('ticket_updated', onTicketUpdated);
+      off('ticket_cleared', onTicketCleared);
+      off('ticket_unbumped', onTicketUnbumped);
+      off('service_ended', onServiceEnded);
     };
   }, []);
 
   const handleJoin = (newSession) => {
+    setServiceId(newSession.serviceId);
     setSession(newSession);
   };
 
-  const createTicket = (table, items) => {
-    socket.emit('create_ticket', { table, items });
-  };
-
-  const toggleItem = (ticketId, itemId) => {
-    socket.emit('toggle_item', { ticketId, itemId });
-  };
-
-  const clearTicket = (ticketId) => {
-    socket.emit('clear_ticket', { ticketId });
-  };
-
-  const unbumpTicket = (ticketId) => {
-    socket.emit('unbump_ticket', { ticketId });
-  };
+  const createTicket = (table, items) => send('create_ticket', { table, items });
+  const toggleItem = (ticketId, itemId) => send('toggle_item', { ticketId, itemId });
+  const clearTicket = (ticketId) => send('clear_ticket', { ticketId });
+  const unbumpTicket = (ticketId) => send('unbump_ticket', { ticketId });
+  const prioritizeTicket = (ticketId) => send('prioritize_ticket', { ticketId });
+  const tagItem = (ticketId, itemId) => send('tag_item', { ticketId, itemId });
 
   const endService = () => {
     if (!window.confirm('Are you sure that you would like to end service? This will clear all active and recent tickets for everyone.')) return;
-    socket.emit('end_service');
+    send('end_service', {});
   };
 
-  const prioritizeTicket = (ticketId) => {
-    socket.emit('prioritize_ticket', { ticketId });
+  // A logged-in restaurant: leaving must NOT delete the manager's persistent restaurant.
+  // Just drop the local session (and log out the manager if signed in on this device).
+  const leaveRestaurant = async () => {
+    clearServiceId();
+    await logout();
+    setSession(null);
+    setTickets([]);
+    setClearedTickets([]);
   };
 
-  const tagItem = (ticketId, itemId) => {
-    socket.emit('tag_item', { ticketId, itemId });
-  };
-
-  // Prioritized tickets first, then oldest first within each group
   const sortedTickets = [...tickets].sort((a, b) => {
     if (a.prioritized && !b.prioritized) return -1;
     if (!a.prioritized && b.prioritized) return 1;
@@ -98,7 +90,7 @@ export default function App() {
   });
 
   if (!session) {
-    return <LandingPage socket={socket} onJoin={handleJoin} />;
+    return <LandingPage onJoin={handleJoin} />;
   }
 
   return (
@@ -106,9 +98,15 @@ export default function App() {
       <header className="app-header">
         <h1>{session.restaurantName}</h1>
         <div className="header-actions">
-          <button className="end-service-btn" onClick={endService}>
-            End Service
-          </button>
+          {session.mode === 'full' ? (
+            <button className="end-service-btn" onClick={leaveRestaurant}>
+              {getToken() ? 'Log Out' : 'Leave'}
+            </button>
+          ) : (
+            <button className="end-service-btn" onClick={endService}>
+              End Service
+            </button>
+          )}
           <span className={`connection-badge ${connected ? 'connected' : 'disconnected'}`}>
             {connected ? 'Live' : 'Offline'}
           </span>
@@ -137,7 +135,6 @@ export default function App() {
                   ))}
                 </div>
               )}
-
               {clearedTickets.length > 0 && (
                 <div className="cleared-section">
                   <div className="cleared-section-label">Recently Cleared</div>
