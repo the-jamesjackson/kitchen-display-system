@@ -47,6 +47,22 @@ async function setup() {
       tagged BOOLEAN NOT NULL DEFAULT false,
       position INTEGER NOT NULL
     );
+
+    -- Append-only cook-time history. Deliberately has NO foreign keys, so it is
+    -- never removed by the ticket purge, service cascade deletes, or End Service.
+    -- One row is written every time an item is completed, across all services.
+    CREATE TABLE IF NOT EXISTS cook_time_logs (
+      id TEXT PRIMARY KEY,
+      item_id TEXT,
+      item_name TEXT NOT NULL,
+      fired_at BIGINT NOT NULL,
+      completed_at BIGINT NOT NULL,
+      queue_depth INTEGER NOT NULL,
+      ticket_size INTEGER NOT NULL,
+      hour_of_day INTEGER NOT NULL,
+      day_of_week INTEGER NOT NULL,
+      created_at BIGINT NOT NULL
+    );
   `);
 
   // For existing deployments without service_id on tickets
@@ -54,16 +70,23 @@ async function setup() {
     ALTER TABLE tickets ADD COLUMN IF NOT EXISTS service_id TEXT REFERENCES services(id) ON DELETE CASCADE;
   `);
 
-  // Mode system: 'quick' = anonymous PIN service, 'full' = manager-owned with config + ML
+  // Mode: 'quick' = anonymous PIN service, 'full' = manager-owned restaurant
   await pool.query(`
     ALTER TABLE services ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'quick';
     ALTER TABLE services ADD COLUMN IF NOT EXISTS manager_id TEXT REFERENCES managers(id) ON DELETE CASCADE;
     ALTER TABLE services ADD COLUMN IF NOT EXISTS target_ticket_time INTEGER;
   `);
 
-  // One-to-one: each manager owns at most one service. NULLs (quick services) are allowed to repeat.
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS services_manager_unique ON services(manager_id);
+  `);
+
+  // Cook-time measurement fields on each item.
+  await pool.query(`
+    ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS fired_at BIGINT;
+    ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS completed_at BIGINT;
+    ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS queue_depth_at_fire INTEGER;
+    ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS ticket_size INTEGER;
   `);
 }
 

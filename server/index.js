@@ -30,10 +30,10 @@ app.use(express.static(clientDist));
 app.get('/health', (_req, res) => res.sendStatus(200));
 
 // --- Manager auth (REST) ---------------------------------------------------
-// Auth and configuration are request/response, so they live on REST.
+// Auth and restaurant setup are request/response, so they live on REST.
 // The live KDS stays on WebSocket. A manager's restaurant, once created here,
-// is just a normal service with a PIN — managers and staff enter it via the
-// existing WebSocket join flow.
+// is just a normal service with a PIN, and managers and staff enter it via
+// the existing WebSocket join flow.
 
 async function auth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -103,7 +103,7 @@ app.post('/api/restaurant', auth, async (req, res) => {
   res.json({ restaurant: { serviceId: id, pin, restaurantName: name } });
 });
 
-// SPA catch-all — must stay last so it doesn't swallow /api routes
+// SPA catch-all: must stay last so it doesn't swallow /api routes
 app.get('*', (_req, res) => res.sendFile(path.join(clientDist, 'index.html')));
 
 // serviceId -> Set<WebSocket>
@@ -225,6 +225,18 @@ wss.on('connection', (ws) => {
         if (!serviceId || !table || !Array.isArray(items) || items.length === 0) return;
         const ticketId = uuidv4();
         const now = Date.now();
+
+        // Queue depth at fire = unfinished items already on the board for this
+        // service, measured before this ticket is added.
+        const { rows: qd } = await pool.query(
+          `SELECT COUNT(*)::int AS depth
+             FROM ticket_items ti
+             JOIN tickets t ON t.id = ti.ticket_id
+            WHERE t.service_id = $1 AND t.cleared = false AND ti.done = false`,
+          [serviceId]
+        );
+        const queueDepth = qd[0].depth;
+
         await pool.query(
           'INSERT INTO tickets (id, service_id, table_num, created_at, prioritized, cleared) VALUES ($1, $2, $3, $4, false, false)',
           [ticketId, serviceId, String(table), now]
@@ -236,10 +248,12 @@ wss.on('connection', (ws) => {
           mods: item.mods ? String(item.mods).trim() : '',
           position,
         }));
+        const ticketSize = mappedItems.length;
+        // Items are considered fired when the ticket hits the board.
         for (const item of mappedItems) {
           await pool.query(
-            'INSERT INTO ticket_items (id, ticket_id, name, quantity, mods, done, tagged, position) VALUES ($1, $2, $3, $4, $5, false, false, $6)',
-            [item.id, ticketId, item.name, item.quantity, item.mods, item.position]
+            'INSERT INTO ticket_items (id, ticket_id, name, quantity, mods, done, tagged, position, fired_at, queue_depth_at_fire, ticket_size) VALUES ($1, $2, $3, $4, $5, false, false, $6, $7, $8, $9)',
+            [item.id, ticketId, item.name, item.quantity, item.mods, item.position, now, queueDepth, ticketSize]
           );
         }
         broadcast(serviceId, 'ticket_created', {
@@ -255,9 +269,44 @@ wss.on('connection', (ws) => {
       case 'toggle_item': {
         const serviceId = ws.serviceId;
         if (!serviceId) return;
-        const { rows } = await pool.query('SELECT done FROM ticket_items WHERE id = $1', [payload.itemId]);
+        const { rows } = await pool.query(
+          'SELECT done, name, fired_at, queue_depth_at_fire, ticket_size FROM ticket_items WHERE id = $1',
+          [payload.itemId]
+        );
         if (rows.length === 0) return;
-        await pool.query('UPDATE ticket_items SET done = $1 WHERE id = $2', [!rows[0].done, payload.itemId]);
+        const item = rows[0];
+        const completing = !item.done;
+
+        if (completing) {
+          const completedAt = Date.now();
+          await pool.query(
+            'UPDATE ticket_items SET done = true, completed_at = $1 WHERE id = $2',
+            [completedAt, payload.itemId]
+          );
+          // An item with no fired_at has no measurable cook time, so don't log it.
+          if (item.fired_at != null) {
+            const firedAt = Number(item.fired_at);
+            const d = new Date(firedAt);
+            await pool.query(
+              `INSERT INTO cook_time_logs
+                 (id, item_id, item_name, fired_at, completed_at, queue_depth, ticket_size, hour_of_day, day_of_week, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+              [
+                uuidv4(), payload.itemId, item.name, firedAt, completedAt,
+                item.queue_depth_at_fire ?? 0, item.ticket_size ?? 1,
+                d.getHours(), d.getDay(), completedAt,
+              ]
+            );
+          }
+        } else {
+          // Un-bumping a single item: clear its completion and drop its stray log row.
+          await pool.query(
+            'UPDATE ticket_items SET done = false, completed_at = NULL WHERE id = $1',
+            [payload.itemId]
+          );
+          await pool.query('DELETE FROM cook_time_logs WHERE item_id = $1', [payload.itemId]);
+        }
+
         const ticket = await getTicket(payload.ticketId);
         if (ticket) broadcast(serviceId, 'ticket_updated', ticket);
         break;
@@ -299,7 +348,12 @@ wss.on('connection', (ws) => {
         const serviceId = ws.serviceId;
         if (!serviceId) return;
         await pool.query('UPDATE tickets SET cleared = false, cleared_at = NULL WHERE id = $1', [payload.ticketId]);
-        await pool.query('UPDATE ticket_items SET done = false WHERE ticket_id = $1', [payload.ticketId]);
+        // Reopening the ticket un-completes its items, so drop their training rows too.
+        await pool.query(
+          'DELETE FROM cook_time_logs WHERE item_id IN (SELECT id FROM ticket_items WHERE ticket_id = $1)',
+          [payload.ticketId]
+        );
+        await pool.query('UPDATE ticket_items SET done = false, completed_at = NULL WHERE ticket_id = $1', [payload.ticketId]);
         const ticket = await getTicket(payload.ticketId);
         if (ticket) broadcast(serviceId, 'ticket_unbumped', ticket);
         break;
