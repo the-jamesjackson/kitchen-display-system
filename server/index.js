@@ -3,7 +3,6 @@ const express = require('express');
 const http = require('http');
 const path = require('path');
 const { WebSocketServer } = require('ws');
-const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const {
@@ -19,6 +18,7 @@ const {
   findSessionManager,
   deleteSession,
 } = require('./db');
+const { predictCookSeconds } = require('./predict');
 
 const app = express();
 const server = http.createServer(app);
@@ -31,9 +31,9 @@ app.get('/health', (_req, res) => res.sendStatus(200));
 
 // --- Manager auth (REST) ---------------------------------------------------
 // Auth and restaurant setup are request/response, so they live on REST.
-// The live KDS stays on WebSocket. A manager's restaurant, once created here,
-// is just a normal service with a PIN, and managers and staff enter it via
-// the existing WebSocket join flow.
+// The live KDS stays on WebSocket. A restaurant created here is just a normal
+// service with a PIN, and managers and staff enter it via the existing
+// WebSocket join flow.
 
 async function auth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -62,7 +62,7 @@ app.post('/api/signup', async (req, res) => {
   if (await findManagerByUsername(username)) {
     return res.status(409).json({ error: 'That username is already taken.' });
   }
-  const id = uuidv4();
+  const id = crypto.randomUUID();
   const passwordHash = await bcrypt.hash(password, 10);
   await createManager(id, username, passwordHash);
   res.json({ token: await issueToken(id), username, restaurant: null });
@@ -91,16 +91,25 @@ app.get('/api/restaurant', auth, async (req, res) => {
 app.post('/api/restaurant', auth, async (req, res) => {
   const name = String(req.body.restaurantName || '').trim();
   if (!name) return res.status(400).json({ error: 'Restaurant name is required.' });
-  // One-to-one: if the manager already has a restaurant, return it instead of creating another.
+  // One-to-one: if this account already has a restaurant, return it instead of creating another.
   const existing = await getManagerRestaurant(req.managerId);
   if (existing) return res.json({ restaurant: existing });
-  const id = uuidv4();
+  const id = crypto.randomUUID();
   const pin = await generatePin();
   await pool.query(
     'INSERT INTO services (id, pin, restaurant_name, created_at, mode, manager_id) VALUES ($1, $2, $3, $4, $5, $6)',
     [id, pin, name, Date.now(), 'full', req.managerId]
   );
   res.json({ restaurant: { serviceId: id, pin, restaurantName: name } });
+});
+
+// Returns predicted cook seconds per item from cook-time history.
+// Body: { items: ["Burger", ...], hour?: 0-23 }. Defaults hour to the server's current hour.
+app.post('/predict/baseline', async (req, res) => {
+  const items = Array.isArray(req.body.items) ? req.body.items : [];
+  const hour = Number.isInteger(req.body.hour) ? req.body.hour : new Date().getHours();
+  const predictions = await predictCookSeconds(items, hour);
+  res.json({ predictions });
 });
 
 // SPA catch-all: must stay last so it doesn't swallow /api routes
@@ -158,7 +167,11 @@ async function getTicket(ticketId) {
     table: t.table_num,
     createdAt: Number(t.created_at),
     prioritized: t.prioritized,
-    items: itemRows.map((i) => ({ id: i.id, name: i.name, quantity: i.quantity, mods: i.mods, done: i.done, tagged: i.tagged })),
+    predictedReadyAt: t.predicted_ready_at != null ? Number(t.predicted_ready_at) : null,
+    items: itemRows.map((i) => ({
+      id: i.id, name: i.name, quantity: i.quantity, mods: i.mods, done: i.done, tagged: i.tagged,
+      fireAt: i.fire_at != null ? Number(i.fire_at) : null,
+    })),
   };
 }
 
@@ -179,7 +192,7 @@ wss.on('connection', (ws) => {
       case 'create_service': {
         const name = String(payload.restaurantName || '').trim();
         if (!name) return;
-        const id = uuidv4();
+        const id = crypto.randomUUID();
         const pin = await generatePin();
         const now = Date.now();
         await pool.query(
@@ -223,7 +236,7 @@ wss.on('connection', (ws) => {
         const serviceId = ws.serviceId;
         const { table, items } = payload;
         if (!serviceId || !table || !Array.isArray(items) || items.length === 0) return;
-        const ticketId = uuidv4();
+        const ticketId = crypto.randomUUID();
         const now = Date.now();
 
         // Queue depth at fire = unfinished items already on the board for this
@@ -237,23 +250,38 @@ wss.on('connection', (ws) => {
         );
         const queueDepth = qd[0].depth;
 
-        await pool.query(
-          'INSERT INTO tickets (id, service_id, table_num, created_at, prioritized, cleared) VALUES ($1, $2, $3, $4, false, false)',
-          [ticketId, serviceId, String(table), now]
-        );
         const mappedItems = items.map((item, position) => ({
-          id: uuidv4(),
+          id: crypto.randomUUID(),
           name: String(item.name).trim(),
           quantity: parseInt(item.quantity, 10) || 1,
           mods: item.mods ? String(item.mods).trim() : '',
           position,
+          fireAt: null,
         }));
         const ticketSize = mappedItems.length;
+
+        // Account-based restaurants schedule fires: predict each item's cook time, pick one
+        // ready moment for the whole ticket, then back each item's fire off that target.
+        const { rows: svc } = await pool.query('SELECT mode FROM services WHERE id = $1', [serviceId]);
+        let predictedReadyAt = null;
+        if (svc.length > 0 && svc[0].mode === 'full') {
+          const predictions = await predictCookSeconds(mappedItems.map((i) => i.name), new Date(now).getHours());
+          const maxCook = Math.max(...mappedItems.map((i) => predictions[i.name]));
+          predictedReadyAt = now + maxCook * 1000;
+          for (const item of mappedItems) {
+            item.fireAt = predictedReadyAt - predictions[item.name] * 1000;
+          }
+        }
+
+        await pool.query(
+          'INSERT INTO tickets (id, service_id, table_num, created_at, prioritized, cleared, predicted_ready_at) VALUES ($1, $2, $3, $4, false, false, $5)',
+          [ticketId, serviceId, String(table), now, predictedReadyAt]
+        );
         // Items are considered fired when the ticket hits the board.
         for (const item of mappedItems) {
           await pool.query(
-            'INSERT INTO ticket_items (id, ticket_id, name, quantity, mods, done, tagged, position, fired_at, queue_depth_at_fire, ticket_size) VALUES ($1, $2, $3, $4, $5, false, false, $6, $7, $8, $9)',
-            [item.id, ticketId, item.name, item.quantity, item.mods, item.position, now, queueDepth, ticketSize]
+            'INSERT INTO ticket_items (id, ticket_id, name, quantity, mods, done, tagged, position, fired_at, queue_depth_at_fire, ticket_size, fire_at) VALUES ($1, $2, $3, $4, $5, false, false, $6, $7, $8, $9, $10)',
+            [item.id, ticketId, item.name, item.quantity, item.mods, item.position, now, queueDepth, ticketSize, item.fireAt]
           );
         }
         broadcast(serviceId, 'ticket_created', {
@@ -261,6 +289,7 @@ wss.on('connection', (ws) => {
           table: String(table),
           createdAt: now,
           prioritized: false,
+          predictedReadyAt,
           items: mappedItems.map((i) => ({ ...i, done: false, tagged: false })),
         });
         break;
@@ -292,7 +321,7 @@ wss.on('connection', (ws) => {
                  (id, item_id, item_name, fired_at, completed_at, queue_depth, ticket_size, hour_of_day, day_of_week, created_at)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
               [
-                uuidv4(), payload.itemId, item.name, firedAt, completedAt,
+                crypto.randomUUID(), payload.itemId, item.name, firedAt, completedAt,
                 item.queue_depth_at_fire ?? 0, item.ticket_size ?? 1,
                 d.getHours(), d.getDay(), completedAt,
               ]

@@ -70,7 +70,7 @@ async function setup() {
     ALTER TABLE tickets ADD COLUMN IF NOT EXISTS service_id TEXT REFERENCES services(id) ON DELETE CASCADE;
   `);
 
-  // Mode: 'quick' = anonymous PIN service, 'full' = manager-owned restaurant
+  // Mode: 'quick' = anonymous PIN service, 'full' = account-based restaurant
   await pool.query(`
     ALTER TABLE services ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'quick';
     ALTER TABLE services ADD COLUMN IF NOT EXISTS manager_id TEXT REFERENCES managers(id) ON DELETE CASCADE;
@@ -87,6 +87,12 @@ async function setup() {
     ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS completed_at BIGINT;
     ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS queue_depth_at_fire INTEGER;
     ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS ticket_size INTEGER;
+  `);
+
+  // Predicted fire time per item, and predicted ready time for the whole ticket.
+  await pool.query(`
+    ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS fire_at BIGINT;
+    ALTER TABLE tickets ADD COLUMN IF NOT EXISTS predicted_ready_at BIGINT;
   `);
 }
 
@@ -131,6 +137,7 @@ function formatTicket(t, items) {
     table: t.table_num,
     createdAt: Number(t.created_at),
     prioritized: t.prioritized,
+    predictedReadyAt: t.predicted_ready_at != null ? Number(t.predicted_ready_at) : null,
     items: items.map((i) => ({
       id: i.id,
       name: i.name,
@@ -138,6 +145,7 @@ function formatTicket(t, items) {
       mods: i.mods,
       done: i.done,
       tagged: i.tagged,
+      fireAt: i.fire_at != null ? Number(i.fire_at) : null,
     })),
   };
 }
@@ -172,7 +180,7 @@ async function deleteSession(token) {
   await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
 }
 
-// Returns the manager's single service as { serviceId, pin, restaurantName }, or null
+// Returns the restaurant linked to this account as { serviceId, pin, restaurantName }, or null
 async function getManagerRestaurant(managerId) {
   const { rows } = await pool.query(
     'SELECT id, pin, restaurant_name FROM services WHERE manager_id = $1',
