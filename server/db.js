@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const pool = new Pool({
@@ -63,6 +64,40 @@ async function setup() {
       day_of_week INTEGER NOT NULL,
       created_at BIGINT NOT NULL
     );
+
+    -- A restaurant's menu: each dish and its normal cook time, set by managers.
+    -- This cook time is the baseline that drives when each item fires.
+    CREATE TABLE IF NOT EXISTS menu_items (
+      id TEXT PRIMARY KEY,
+      service_id TEXT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      cook_seconds INTEGER NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+
+    -- A modifier on a dish (e.g. "well done"), with how much it changes cook time.
+    -- cook_delta_seconds can be negative (e.g. "rare" cooks faster).
+    CREATE TABLE IF NOT EXISTS modifiers (
+      id TEXT PRIMARY KEY,
+      menu_item_id TEXT NOT NULL REFERENCES menu_items(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      cook_delta_seconds INTEGER NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+  `);
+
+  // One entry per dish name within a restaurant, matched case-insensitively.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS menu_items_service_name ON menu_items (service_id, lower(name));
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS modifiers_item_name ON modifiers (menu_item_id, lower(name));
+  `);
+
+  // When true, a ticket item for this dish must have at least one modifier chosen.
+  await pool.query(`
+    ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS requires_modifier BOOLEAN NOT NULL DEFAULT false;
   `);
 
   // For existing deployments without service_id on tickets
@@ -93,6 +128,11 @@ async function setup() {
   await pool.query(`
     ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS fire_at BIGINT;
     ALTER TABLE tickets ADD COLUMN IF NOT EXISTS predicted_ready_at BIGINT;
+  `);
+
+  // Modifiers chosen for a ticket item, stored as a JSON array of names.
+  await pool.query(`
+    ALTER TABLE ticket_items ADD COLUMN IF NOT EXISTS modifiers TEXT NOT NULL DEFAULT '[]';
   `);
 }
 
@@ -131,6 +171,17 @@ async function attachItems(ticketRows) {
   return ticketRows.map((t) => formatTicket(t, itemRows.filter((i) => i.ticket_id === t.id)));
 }
 
+// The modifiers column holds a JSON array of names; fall back to empty on bad data.
+function parseModifiers(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function formatTicket(t, items) {
   return {
     id: t.id,
@@ -143,6 +194,7 @@ function formatTicket(t, items) {
       name: i.name,
       quantity: i.quantity,
       mods: i.mods,
+      modifiers: parseModifiers(i.modifiers),
       done: i.done,
       tagged: i.tagged,
       fireAt: i.fire_at != null ? Number(i.fire_at) : null,
@@ -190,6 +242,56 @@ async function getManagerRestaurant(managerId) {
   return { serviceId: rows[0].id, pin: rows[0].pin, restaurantName: rows[0].restaurant_name };
 }
 
+// Returns a restaurant's menu as [{ name, cookSeconds, modifiers: [{ name, cookDeltaSeconds }] }]
+async function getMenu(serviceId) {
+  const { rows: itemRows } = await pool.query(
+    'SELECT id, name, cook_seconds, requires_modifier FROM menu_items WHERE service_id = $1 ORDER BY name ASC',
+    [serviceId]
+  );
+  if (itemRows.length === 0) return [];
+  const ids = itemRows.map((r) => r.id);
+  const { rows: modRows } = await pool.query(
+    'SELECT menu_item_id, name, cook_delta_seconds FROM modifiers WHERE menu_item_id = ANY($1) ORDER BY cook_delta_seconds ASC',
+    [ids]
+  );
+  return itemRows.map((r) => ({
+    name: r.name,
+    cookSeconds: r.cook_seconds,
+    requiresModifier: r.requires_modifier,
+    modifiers: modRows
+      .filter((m) => m.menu_item_id === r.id)
+      .map((m) => ({ name: m.name, cookDeltaSeconds: m.cook_delta_seconds })),
+  }));
+}
+
+// Replaces a restaurant's whole menu (items and their modifiers) in one transaction.
+async function replaceMenu(serviceId, items) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM menu_items WHERE service_id = $1', [serviceId]); // cascade drops modifiers
+    for (const item of items) {
+      const itemId = crypto.randomUUID();
+      await client.query(
+        'INSERT INTO menu_items (id, service_id, name, cook_seconds, requires_modifier, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+        [itemId, serviceId, item.name, item.cookSeconds, !!item.requiresModifier, Date.now()]
+      );
+      for (const mod of item.modifiers || []) {
+        await client.query(
+          'INSERT INTO modifiers (id, menu_item_id, name, cook_delta_seconds, created_at) VALUES ($1, $2, $3, $4, $5)',
+          [crypto.randomUUID(), itemId, mod.name, mod.cookDeltaSeconds, Date.now()]
+        );
+      }
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   pool,
   setup,
@@ -202,4 +304,7 @@ module.exports = {
   createSession,
   findSessionManager,
   deleteSession,
+  getMenu,
+  replaceMenu,
+  parseModifiers,
 };

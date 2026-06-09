@@ -37,7 +37,7 @@ export async function createRestaurant(restaurantName) {
   return data.restaurant; // { serviceId, pin, restaurantName }
 }
 
-// Validate the stored token and fetch the manager's restaurant (or null). Clears a dead token.
+// Validate the stored token and fetch this account's restaurant (or null). Clears a dead token.
 export async function fetchRestaurant() {
   if (!getToken()) return null;
   try {
@@ -47,6 +47,18 @@ export async function fetchRestaurant() {
     clearToken();
     return null;
   }
+}
+
+// Returns the restaurant's menu as [{ name, cookSeconds }].
+export async function fetchMenu() {
+  const data = await request('/api/menu', { authed: true });
+  return data.menu;
+}
+
+// Replaces the whole menu. Returns the saved (validated) menu.
+export async function saveMenu(items) {
+  const data = await request('/api/menu', { method: 'PUT', body: { items }, authed: true });
+  return data.menu;
 }
 
 export async function logout() {

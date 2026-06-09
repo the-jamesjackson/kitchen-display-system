@@ -4,20 +4,25 @@ import { logout, getToken } from './auth';
 import TicketForm from './components/TicketForm';
 import TicketCard from './components/TicketCard';
 import LandingPage from './components/LandingPage';
+import MenuEditor from './components/MenuEditor';
 
 export default function App() {
-  const [session, setSession] = useState(null); // { serviceId, restaurantName }
+  const [session, setSession] = useState(null); // { serviceId, restaurantName, mode }
   const [tickets, setTickets] = useState([]);
   const [clearedTickets, setClearedTickets] = useState([]);
+  const [menu, setMenu] = useState([]);
+  const [editingMenu, setEditingMenu] = useState(false);
   const [connected, setConnected] = useState(false);
 
   useEffect(() => {
     const onConnect = () => setConnected(true);
     const onDisconnect = () => setConnected(false);
-    const onInit = ({ tickets: active, clearedTickets: cleared }) => {
+    const onInit = ({ tickets: active, clearedTickets: cleared, menu: m }) => {
       setTickets(active);
       setClearedTickets(cleared);
+      setMenu(m || []);
     };
+    const onMenuUpdated = ({ menu: m }) => setMenu(m || []);
     const onTicketCreated = (ticket) => setTickets((prev) => [...prev, ticket]);
     const onTicketUpdated = (updated) => setTickets((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
     const onTicketCleared = (ticket) => {
@@ -33,11 +38,13 @@ export default function App() {
       setSession(null);
       setTickets([]);
       setClearedTickets([]);
+      setMenu([]);
     };
 
     on('connect', onConnect);
     on('disconnect', onDisconnect);
     on('init', onInit);
+    on('menu_updated', onMenuUpdated);
     on('ticket_created', onTicketCreated);
     on('ticket_updated', onTicketUpdated);
     on('ticket_cleared', onTicketCleared);
@@ -48,6 +55,7 @@ export default function App() {
       off('connect', onConnect);
       off('disconnect', onDisconnect);
       off('init', onInit);
+      off('menu_updated', onMenuUpdated);
       off('ticket_created', onTicketCreated);
       off('ticket_updated', onTicketUpdated);
       off('ticket_cleared', onTicketCleared);
@@ -73,8 +81,8 @@ export default function App() {
     send('end_service', {});
   };
 
-  // A logged-in restaurant: leaving must NOT delete the manager's persistent restaurant.
-  // Just drop the local session (and log out the manager if signed in on this device).
+  // A logged-in restaurant: leaving must NOT delete the saved restaurant.
+  // Just drop the local session (and log out the account if signed in on this device).
   const leaveRestaurant = async () => {
     clearServiceId();
     await logout();
@@ -95,9 +103,15 @@ export default function App() {
 
   return (
     <div className="app">
+      {editingMenu && <MenuEditor onClose={() => setEditingMenu(false)} />}
       <header className="app-header">
         <h1>{session.restaurantName}</h1>
         <div className="header-actions">
+          {session.mode === 'full' && getToken() && (
+            <button className="menu-edit-btn" onClick={() => setEditingMenu(true)}>
+              Edit Menu
+            </button>
+          )}
           {session.mode === 'full' ? (
             <button className="end-service-btn" onClick={leaveRestaurant}>
               {getToken() ? 'Log Out' : 'Leave'}
@@ -114,7 +128,7 @@ export default function App() {
       </header>
       <div className="app-body">
         <aside className="form-panel">
-          <TicketForm onSubmit={createTicket} />
+          <TicketForm onSubmit={createTicket} menu={session.mode === 'full' ? menu : []} />
         </aside>
         <main className="tickets-panel">
           {sortedTickets.length === 0 && clearedTickets.length === 0 ? (

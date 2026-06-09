@@ -17,8 +17,11 @@ const {
   createSession,
   findSessionManager,
   deleteSession,
+  getMenu,
+  replaceMenu,
+  parseModifiers,
 } = require('./db');
-const { predictCookSeconds } = require('./predict');
+const { predictCookSeconds, predictItems } = require('./predict');
 
 const app = express();
 const server = http.createServer(app);
@@ -103,6 +106,51 @@ app.post('/api/restaurant', auth, async (req, res) => {
   res.json({ restaurant: { serviceId: id, pin, restaurantName: name } });
 });
 
+// A restaurant's menu (manager only). Returns [{ name, cookSeconds }].
+app.get('/api/menu', auth, async (req, res) => {
+  const restaurant = await getManagerRestaurant(req.managerId);
+  if (!restaurant) return res.status(404).json({ error: 'No restaurant for this account.' });
+  res.json({ menu: await getMenu(restaurant.serviceId) });
+});
+
+// Replaces the whole menu (manager only). Body: { items: [{ name, cookSeconds }] }.
+app.put('/api/menu', auth, async (req, res) => {
+  const restaurant = await getManagerRestaurant(req.managerId);
+  if (!restaurant) return res.status(404).json({ error: 'No restaurant for this account.' });
+  const raw = Array.isArray(req.body.items) ? req.body.items : [];
+  const seen = new Set();
+  const items = [];
+  for (const entry of raw) {
+    const name = String(entry.name || '').trim();
+    const cookSeconds = Math.round(Number(entry.cookSeconds));
+    if (!name || !Number.isFinite(cookSeconds) || cookSeconds <= 0) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const rawMods = Array.isArray(entry.modifiers) ? entry.modifiers : [];
+    const modSeen = new Set();
+    const modifiers = [];
+    for (const m of rawMods) {
+      const modName = String(m.name || '').trim();
+      const cookDeltaSeconds = Math.round(Number(m.cookDeltaSeconds));
+      if (!modName || !Number.isFinite(cookDeltaSeconds)) continue;
+      const modKey = modName.toLowerCase();
+      if (modSeen.has(modKey)) continue;
+      modSeen.add(modKey);
+      modifiers.push({ name: modName, cookDeltaSeconds });
+    }
+    // Requiring a modifier only makes sense when the dish actually has some.
+    const requiresModifier = !!entry.requiresModifier && modifiers.length > 0;
+    items.push({ name, cookSeconds, modifiers, requiresModifier });
+  }
+  await replaceMenu(restaurant.serviceId, items);
+  const menu = await getMenu(restaurant.serviceId);
+  // Push the new menu to every screen currently in this restaurant.
+  broadcast(restaurant.serviceId, 'menu_updated', { menu });
+  res.json({ menu });
+});
+
 // Returns predicted cook seconds per item from cook-time history.
 // Body: { items: ["Burger", ...], hour?: 0-23 }. Defaults hour to the server's current hour.
 app.post('/predict/baseline', async (req, res) => {
@@ -169,7 +217,8 @@ async function getTicket(ticketId) {
     prioritized: t.prioritized,
     predictedReadyAt: t.predicted_ready_at != null ? Number(t.predicted_ready_at) : null,
     items: itemRows.map((i) => ({
-      id: i.id, name: i.name, quantity: i.quantity, mods: i.mods, done: i.done, tagged: i.tagged,
+      id: i.id, name: i.name, quantity: i.quantity, mods: i.mods, modifiers: parseModifiers(i.modifiers),
+      done: i.done, tagged: i.tagged,
       fireAt: i.fire_at != null ? Number(i.fire_at) : null,
     })),
   };
@@ -202,7 +251,7 @@ wss.on('connection', (ws) => {
         ws.serviceId = id;
         addToRoom(id, ws);
         send(ws, 'service_created', { serviceId: id, pin, restaurantName: name, mode: 'quick' });
-        send(ws, 'init', { tickets: [], clearedTickets: [] });
+        send(ws, 'init', { tickets: [], clearedTickets: [], menu: [] });
         break;
       }
 
@@ -212,9 +261,11 @@ wss.on('connection', (ws) => {
         const { id, restaurant_name, mode } = rows[0];
         ws.serviceId = id;
         addToRoom(id, ws);
-        const [tickets, clearedTickets] = await Promise.all([fetchActiveTickets(id), fetchClearedTickets(id)]);
+        const [tickets, clearedTickets, menu] = await Promise.all([
+          fetchActiveTickets(id), fetchClearedTickets(id), getMenu(id),
+        ]);
         send(ws, 'service_joined', { serviceId: id, restaurantName: restaurant_name, mode });
-        send(ws, 'init', { tickets, clearedTickets });
+        send(ws, 'init', { tickets, clearedTickets, menu });
         break;
       }
 
@@ -224,11 +275,12 @@ wss.on('connection', (ws) => {
         if (rows.length === 0) { send(ws, 'service_ended', {}); return; }
         ws.serviceId = payload.serviceId;
         addToRoom(payload.serviceId, ws);
-        const [tickets, clearedTickets] = await Promise.all([
+        const [tickets, clearedTickets, menu] = await Promise.all([
           fetchActiveTickets(payload.serviceId),
           fetchClearedTickets(payload.serviceId),
+          getMenu(payload.serviceId),
         ]);
-        send(ws, 'init', { tickets, clearedTickets });
+        send(ws, 'init', { tickets, clearedTickets, menu });
         break;
       }
 
@@ -255,6 +307,7 @@ wss.on('connection', (ws) => {
           name: String(item.name).trim(),
           quantity: parseInt(item.quantity, 10) || 1,
           mods: item.mods ? String(item.mods).trim() : '',
+          modifiers: Array.isArray(item.modifiers) ? item.modifiers.map((m) => String(m).trim()).filter(Boolean) : [],
           position,
           fireAt: null,
         }));
@@ -265,12 +318,12 @@ wss.on('connection', (ws) => {
         const { rows: svc } = await pool.query('SELECT mode FROM services WHERE id = $1', [serviceId]);
         let predictedReadyAt = null;
         if (svc.length > 0 && svc[0].mode === 'full') {
-          const predictions = await predictCookSeconds(mappedItems.map((i) => i.name), new Date(now).getHours());
-          const maxCook = Math.max(...mappedItems.map((i) => predictions[i.name]));
+          const cookTimes = await predictItems(serviceId, mappedItems, new Date(now).getHours());
+          const maxCook = Math.max(...cookTimes);
           predictedReadyAt = now + maxCook * 1000;
-          for (const item of mappedItems) {
-            item.fireAt = predictedReadyAt - predictions[item.name] * 1000;
-          }
+          mappedItems.forEach((item, idx) => {
+            item.fireAt = predictedReadyAt - cookTimes[idx] * 1000;
+          });
         }
 
         await pool.query(
@@ -280,8 +333,8 @@ wss.on('connection', (ws) => {
         // Items are considered fired when the ticket hits the board.
         for (const item of mappedItems) {
           await pool.query(
-            'INSERT INTO ticket_items (id, ticket_id, name, quantity, mods, done, tagged, position, fired_at, queue_depth_at_fire, ticket_size, fire_at) VALUES ($1, $2, $3, $4, $5, false, false, $6, $7, $8, $9, $10)',
-            [item.id, ticketId, item.name, item.quantity, item.mods, item.position, now, queueDepth, ticketSize, item.fireAt]
+            'INSERT INTO ticket_items (id, ticket_id, name, quantity, mods, done, tagged, position, fired_at, queue_depth_at_fire, ticket_size, fire_at, modifiers) VALUES ($1, $2, $3, $4, $5, false, false, $6, $7, $8, $9, $10, $11)',
+            [item.id, ticketId, item.name, item.quantity, item.mods, item.position, now, queueDepth, ticketSize, item.fireAt, JSON.stringify(item.modifiers)]
           );
         }
         broadcast(serviceId, 'ticket_created', {

@@ -1,58 +1,77 @@
 import { useState, useEffect } from 'react';
 
-function useElapsed(createdAt) {
-  const [elapsed, setElapsed] = useState('');
-
+// One ticking clock per card, shared by the elapsed timer and every fire countdown.
+function useNow() {
+  const [now, setNow] = useState(Date.now());
   useEffect(() => {
-    const update = () => {
-      const total = Math.floor((Date.now() - createdAt) / 1000);
-      const m = Math.floor(total / 60);
-      const s = total % 60;
-      setElapsed(m > 0 ? `${m}m ${s}s` : `${s}s`);
-    };
-    update();
-    const id = setInterval(update, 1000);
+    const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [createdAt]);
-
-  return elapsed;
+  }, []);
+  return now;
 }
 
-function formatFiredTime(createdAt) {
-  return new Date(createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function formatElapsed(ms) {
+  const total = Math.floor(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function formatCountdown(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function formatClock(ts) {
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 export default function TicketCard({ ticket, onToggleItem, onClear, isCleared, onUnbump, onPrioritize, onTagItem }) {
   const allDone = ticket.items.every((item) => item.done);
-  const elapsed = useElapsed(ticket.createdAt);
+  const now = useNow();
+  const elapsed = formatElapsed(now - ticket.createdAt);
 
   const isWide = ticket.items.length > 5;
   const firstCol = isWide ? ticket.items.slice(0, 5) : ticket.items;
   const secondCol = isWide ? ticket.items.slice(5) : [];
 
-  const renderItem = (item) => (
-    <li
-      key={item.id}
-      className={`item ${item.done ? 'item-done' : 'item-pending'}${isCleared ? ' item-no-tap' : ''}${item.tagged ? ' item-tagged' : ''}`}
-      onClick={() => !isCleared && onToggleItem(ticket.id, item.id)}
-    >
-      <span className="item-qty">×{item.quantity}</span>
-      <span className="item-name">
-        {item.name}
-        {item.mods && <span className="item-mods">{item.mods}</span>}
-      </span>
-      {!isCleared && (
-        <button
-          className="tag-btn"
-          onClick={(e) => { e.stopPropagation(); onTagItem(ticket.id, item.id); }}
-          aria-label="Tag item"
-        >
-          Tag
-        </button>
-      )}
-      <span className="item-check">{item.done ? '✓' : ''}</span>
-    </li>
-  );
+  const renderItem = (item) => {
+    const showFire = item.fireAt != null && !item.done && !isCleared;
+    const firing = showFire && item.fireAt - now <= 0;
+    return (
+      <li
+        key={item.id}
+        className={`item ${item.done ? 'item-done' : 'item-pending'}${isCleared ? ' item-no-tap' : ''}${item.tagged ? ' item-tagged' : ''}`}
+        onClick={() => !isCleared && onToggleItem(ticket.id, item.id)}
+      >
+        <span className="item-qty">×{item.quantity}</span>
+        <span className="item-name">
+          {item.name}
+          {item.modifiers && item.modifiers.length > 0 && (
+            <span className="item-modifiers">{item.modifiers.join(', ')}</span>
+          )}
+          {item.mods && <span className="item-mods">{item.mods}</span>}
+        </span>
+        {showFire && (
+          <span className={`item-fire${firing ? ' firing' : ''}`}>
+            {firing ? 'FIRE' : formatCountdown(item.fireAt - now)}
+          </span>
+        )}
+        {!isCleared && (
+          <button
+            className="tag-btn"
+            onClick={(e) => { e.stopPropagation(); onTagItem(ticket.id, item.id); }}
+            aria-label="Tag item"
+          >
+            Tag
+          </button>
+        )}
+        <span className="item-check">{item.done ? '✓' : ''}</span>
+      </li>
+    );
+  };
 
   return (
     <div className={`ticket-card${allDone && !isCleared ? ' ticket-complete' : ''}${isCleared ? ' ticket-cleared' : ''}${ticket.prioritized ? ' ticket-prioritized' : ''}${isWide ? ' ticket-wide' : ''}`}>
@@ -63,8 +82,11 @@ export default function TicketCard({ ticket, onToggleItem, onClear, isCleared, o
       <div className="ticket-header">
         <span className="table-label">Table {ticket.table}</span>
         <div className="ticket-meta">
-          <span className="fired-time">Fired {formatFiredTime(ticket.createdAt)}</span>
+          <span className="fired-time">Fired {formatClock(ticket.createdAt)}</span>
           <span className="elapsed">{elapsed}</span>
+          {ticket.predictedReadyAt != null && !isCleared && (
+            <span className="predicted-ready">Ready ~{formatClock(ticket.predictedReadyAt)}</span>
+          )}
         </div>
       </div>
 

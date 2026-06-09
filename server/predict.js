@@ -1,4 +1,4 @@
-const { pool } = require('./db');
+const { pool, getMenu } = require('./db');
 
 // Average over recent history only, so predictions track how the kitchen runs now.
 const ROLLING_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
@@ -54,4 +54,40 @@ async function predictCookSeconds(names, hour) {
   return result;
 }
 
-module.exports = { predictCookSeconds, DEFAULT_COOK_SECONDS };
+// Predicted cook time never drops below this, even with large negative modifiers.
+const MIN_COOK_SECONDS = 30;
+
+// Predicts cook seconds per ticket item, in order. Each item is { name, modifiers }.
+// The menu cook time is the baseline; selected modifiers add their deltas. Items
+// not on the menu fall back to the historical average, then the default.
+async function predictItems(serviceId, items, hour) {
+  if (items.length === 0) return [];
+
+  const menu = await getMenu(serviceId);
+  const menuByName = new Map();
+  for (const m of menu) {
+    const modDeltas = new Map(m.modifiers.map((mod) => [mod.name.toLowerCase(), mod.cookDeltaSeconds]));
+    menuByName.set(m.name.toLowerCase(), { base: m.cookSeconds, modDeltas });
+  }
+
+  // Only ask the historical predictor about items the menu does not cover.
+  const offMenu = items.map((i) => i.name).filter((n) => !menuByName.has(String(n).toLowerCase()));
+  const historical = offMenu.length > 0 ? await predictCookSeconds(offMenu, hour) : {};
+
+  return items.map((item) => {
+    const entry = menuByName.get(String(item.name).toLowerCase());
+    let seconds;
+    if (entry) {
+      seconds = entry.base;
+      for (const modName of item.modifiers || []) {
+        const delta = entry.modDeltas.get(String(modName).toLowerCase());
+        if (delta != null) seconds += delta;
+      }
+    } else {
+      seconds = historical[item.name];
+    }
+    return Math.max(MIN_COOK_SECONDS, Math.round(seconds));
+  });
+}
+
+module.exports = { predictCookSeconds, predictItems, DEFAULT_COOK_SECONDS };
